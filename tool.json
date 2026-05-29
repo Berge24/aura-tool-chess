@@ -1,0 +1,19 @@
+{
+  "tool_id": "chess",
+  "title": "Scacchi",
+  "subtitle": "Gioca una partita di scacchi contro AURA (motore locale).",
+  "icon": "\u265F\uFE0F",
+  "verb": "gioca",
+  "keywords": [
+    "scacchi",
+    "chess",
+    "gioca a scacchi",
+    "partita a scacchi",
+    "sfida a scacchi",
+    "giochiamo a scacchi"
+  ],
+  "version": "1.0.0",
+  "author": "AURA add-ons",
+  "description": "Una partita di scacchi completa contro AURA: arrocco, en passant, promozione, scacco matto e stallo. AURA muove con un motore minimax/alfa-beta eseguito in locale (nessuna connessione di rete). Tre livelli di difficolta'.",
+  "aura_compatible": true
+}
