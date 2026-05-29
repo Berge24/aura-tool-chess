@@ -21,11 +21,13 @@ API pubblica: build_chess_panel(window).
 
 from __future__ import annotations
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import (
+    Qt, QThread, Signal, QPropertyAnimation, QPoint, QEasingCurve,
+)
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QComboBox, QFrame, QGridLayout, QHBoxLayout, QInputDialog, QLabel,
-    QMessageBox, QPushButton, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QTextEdit, QVBoxLayout, QWidget,
 )
 
 try:
@@ -50,6 +52,9 @@ LASTMOVE_SQ = "#cdd26a"     # ultima mossa
 TARGET_RING = "#d64f4f"     # bordo per catture legali
 
 SQUARE_PX = 58
+
+# Durata dello scivolamento dei pezzi (ms). Piu' alto = piu' lento.
+ANIM_MS = 420
 
 
 # ============================================================
@@ -149,6 +154,10 @@ def build_chess_panel(window):
         "ai_worker": None,
         "closed": False,
         "recorded": False,
+        "animating": False,
+        "anim": None,          # QPropertyAnimation in volo
+        "floating": None,      # QLabel del pezzo in volo
+        "san_history": [],     # mosse in notazione SAN, in ordine di gioco
     }
     squares: dict[int, SquareButton] = {}
 
@@ -205,6 +214,16 @@ def build_chess_panel(window):
     board_grid.setContentsMargins(0, 0, 0, 0)
     board_outer.addWidget(board_grid_widget, alignment=Qt.AlignCenter)
 
+    # ---------- Registro mosse (dentro il pannello: la chat non scorre) ----------
+    moves_log = QTextEdit()
+    moves_log.setReadOnly(True)
+    moves_log.setFixedHeight(86)
+    moves_log.setFont(QFont("Courier New", 11))
+    moves_log.setStyleSheet(
+        "QTextEdit { background:#0f172a; color:#cbd5e1; border:1px solid #334155;"
+        " border-radius:8px; padding:6px; }"
+    )
+
     stats_label = QLabel("")
     stats_label.setAlignment(Qt.AlignCenter)
     stats_label.setStyleSheet("color:#94a3b8; font-size:12px; padding-top:4px;")
@@ -229,6 +248,8 @@ def build_chess_panel(window):
         return list(ranks), list(files)
 
     def build_board_grid():
+        # ferma eventuali animazioni in corso
+        _cancel_animation()
         # svuota la griglia
         while board_grid.count():
             item = board_grid.takeAt(0)
@@ -281,6 +302,106 @@ def build_chess_panel(window):
             is_target_cap = s in targets and p != EMPTY
             btn.render(glyph, is_light, selected, is_last,
                        is_target_empty, is_target_cap)
+
+    def render_move_log():
+        h = state["san_history"]
+        lines = []
+        i = 0
+        num = 1
+        while i < len(h):
+            white = h[i]
+            black = h[i + 1] if i + 1 < len(h) else ""
+            lines.append(f"{num:>2}. {white:<7} {black}".rstrip())
+            i += 2
+            num += 1
+        moves_log.setPlainText("\n".join(lines))
+        sb = moves_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _cancel_animation():
+        anim = state.get("anim")
+        if anim is not None:
+            try:
+                anim.stop()
+            except Exception:
+                pass
+        flo = state.get("floating")
+        if flo is not None:
+            try:
+                flo.deleteLater()
+            except Exception:
+                pass
+        state["anim"] = None
+        state["floating"] = None
+        state["animating"] = False
+
+    def _animate_move(move: Move, on_done):
+        """Fa scivolare il pezzo dalla casella di partenza a quella d'arrivo,
+        poi applica la mossa al motore (in _commit_move)."""
+        b = state["board"]
+        piece = b.board[move.frm]
+        glyph = GLYPHS.get(piece, "")
+        src_btn = squares.get(move.frm)
+        dst_btn = squares.get(move.to)
+
+        # se le geometrie non sono pronte, applica subito senza animazione
+        if (not src_btn or not dst_btn or src_btn.width() == 0
+                or src_btn.geometry() == dst_btn.geometry()):
+            _commit_move(move, on_done)
+            return
+
+        state["animating"] = True
+        # nascondi il glifo sulla casella di partenza durante il volo
+        src_btn.setText("")
+
+        flo = QLabel(board_grid_widget)
+        flo.setAlignment(Qt.AlignCenter)
+        flo.setFont(src_btn.font())
+        flo.setStyleSheet(
+            "QLabel { background: transparent; color:#111111; font-size:34px; }"
+        )
+        flo.setText(glyph)
+        flo.resize(src_btn.size())
+        flo.move(src_btn.pos())
+        flo.show()
+        flo.raise_()
+        state["floating"] = flo
+
+        anim = QPropertyAnimation(flo, b"pos")
+        anim.setDuration(ANIM_MS)
+        anim.setStartValue(QPoint(src_btn.pos()))
+        anim.setEndValue(QPoint(dst_btn.pos()))
+        anim.setEasingCurve(QEasingCurve.InOutQuad)
+
+        def _finished():
+            f = state.get("floating")
+            if f is not None:
+                try:
+                    f.deleteLater()
+                except Exception:
+                    pass
+            state["floating"] = None
+            state["anim"] = None
+            state["animating"] = False
+            _commit_move(move, on_done)
+
+        anim.finished.connect(_finished)
+        state["anim"] = anim
+        anim.start()
+
+    def _commit_move(move: Move, on_done):
+        """Applica la mossa al motore, aggiorna scacchiera e registro."""
+        if state["closed"]:
+            return
+        b = state["board"]
+        san = move_to_san(b, move)  # calcolato PRIMA di make_move
+        b.make_move(move)
+        state["last_move"] = (move.frm, move.to)
+        state["san_history"].append(san)
+        refresh_board()
+        render_move_log()
+        if on_done:
+            on_done()
 
     def material_balance() -> str:
         b = state["board"]
@@ -335,7 +456,7 @@ def build_chess_panel(window):
 
     def on_square_click(square: int):
         b = state["board"]
-        if state["game_over"] or state["ai_thinking"]:
+        if state["game_over"] or state["ai_thinking"] or state["animating"]:
             return
         if b.turn != state["player_color"]:
             return
@@ -359,7 +480,6 @@ def build_chess_panel(window):
             refresh_board()
 
     def _finalize_player_move(move: Move):
-        b = state["board"]
         # gestione promozione: se ci sono piu' mosse stessa destinazione (promo)
         promos = [m for m in state["legal_from_sel"]
                   if m.to == move.to and m.flag == "p"]
@@ -368,19 +488,19 @@ def build_chess_panel(window):
             piece = _ask_promotion()
             chosen = next((m for m in promos if m.promo == piece), promos[0])
 
-        san = move_to_san(b, chosen)
-        b.make_move(chosen)
-        state["last_move"] = (chosen.frm, chosen.to)
+        # togli selezione/evidenziazioni e blocca la scacchiera durante il volo
         state["selected"] = None
         state["legal_from_sel"] = []
-        state["player_moves"] += 1
+        set_board_enabled(False)
         refresh_board()
-        _safe_info(f"La tua mossa: {san}")
 
-        if _check_game_over():
-            return
-        # tocca all'IA
-        _start_ai()
+        def after_player():
+            state["player_moves"] += 1
+            if _check_game_over():
+                return
+            _start_ai()
+
+        _animate_move(chosen, after_player)
 
     def _ask_promotion() -> str:
         items = ["Donna", "Torre", "Alfiere", "Cavallo"]
@@ -411,25 +531,25 @@ def build_chess_panel(window):
         if state["closed"]:
             return
         state["ai_thinking"] = False
-        set_board_enabled(True)
         b = state["board"]
         move = _match_legal(uci)
         if move is None:
             # fallback: scegli sul momento (non dovrebbe servire)
             move = select_ai_move(b, state["difficulty"])
         if move is None:
+            set_board_enabled(True)
             refresh_status()
             return
-        san = move_to_san(b, move)
-        b.make_move(move)
-        state["last_move"] = (move.frm, move.to)
-        refresh_board()
-        _safe_info(f"AURA gioca: {san}")
-        try:
-            window.set_state("idle", "scacchi")
-        except Exception:
-            pass
-        _check_game_over()
+
+        def after_ai():
+            try:
+                window.set_state("idle", "scacchi")
+            except Exception:
+                pass
+            if not _check_game_over():
+                set_board_enabled(True)
+
+        _animate_move(move, after_ai)
 
     def _match_legal(uci: str) -> Move | None:
         if not uci or len(uci) < 4:
@@ -471,7 +591,6 @@ def build_chess_panel(window):
             mood = ("warning", "scacchi: AURA vince")
 
         status.setText(msg)
-        _safe_info("\u2654 " + msg)
         try:
             window.set_state(*mood)
         except Exception:
@@ -483,16 +602,10 @@ def build_chess_panel(window):
             update_stats_label()
         return True
 
-    def _safe_info(text: str):
-        try:
-            if not state["closed"]:
-                window.add_info_message(text)
-        except Exception:
-            pass
-
     # ---------- Azioni dei controlli ----------
 
     def new_game():
+        _cancel_animation()
         state["board"] = Board()
         state["player_color"] = WHITE if color_combo.currentIndex() == 0 else BLACK
         state["difficulty"] = ["facile", "medio", "difficile"][diff_combo.currentIndex()]
@@ -503,7 +616,9 @@ def build_chess_panel(window):
         state["player_moves"] = 0
         state["ai_thinking"] = False
         state["recorded"] = False
+        state["san_history"] = []
         build_board_grid()
+        render_move_log()
         refresh_status()
         try:
             window.set_state("happy", "scacchi: nuova partita")
@@ -515,12 +630,14 @@ def build_chess_panel(window):
 
     def undo():
         b = state["board"]
-        if state["ai_thinking"] or len(b._undo_stack) == 0:
+        if state["ai_thinking"] or state["animating"] or len(b._undo_stack) == 0:
             return
         # annulla la coppia (mossa IA + mossa giocatore) per restare al proprio tratto
         b.undo_move()
+        state["san_history"] = state["san_history"][:-1]
         if len(b._undo_stack) > 0 and b.turn != state["player_color"]:
             b.undo_move()
+            state["san_history"] = state["san_history"][:-1]
         if state["player_moves"] > 0:
             state["player_moves"] -= 1
         state["selected"] = None
@@ -530,6 +647,7 @@ def build_chess_panel(window):
         state["recorded"] = False
         set_board_enabled(True)
         refresh_board()
+        render_move_log()
         refresh_status()
 
     def resign():
@@ -543,7 +661,6 @@ def build_chess_panel(window):
         state["game_over"] = True
         set_board_enabled(False)
         status.setText("Hai abbandonato. AURA vince.")
-        _safe_info("\u2654 Hai abbandonato la partita.")
         if not state["recorded"]:
             color_name = "Bianco" if state["player_color"] == WHITE else "Nero"
             record_game("loss", state["difficulty"], color_name, state["player_moves"])
@@ -564,6 +681,7 @@ def build_chess_panel(window):
     card.add_content(status)
     card.add_content(material)
     card.add_content(board_frame)
+    card.add_content(moves_log)
     card.add_content(stats_label)
 
     # ---------- Inizializzazione ----------
